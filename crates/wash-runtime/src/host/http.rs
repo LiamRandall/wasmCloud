@@ -1182,6 +1182,14 @@ async fn run_http_server<T: Router>(
                     Ok((client, client_addr)) => {
                         debug!(addr = ?client_addr, "new HTTP client connection");
 
+                        // Disable Nagle's algorithm: the p3 response path writes
+                        // headers/body in separate small segments, which interacts with
+                        // delayed ACKs (~40ms stall per request on Linux keepalive
+                        // connections). Same as wasmtime serve's accept path.
+                        if let Err(e) = client.set_nodelay(true) {
+                            warn!(err = ?e, "failed to set TCP_NODELAY on client connection");
+                        }
+
                         let handles_clone = workload_handles.clone();
                         let service_handlers_clone = service_handlers.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
