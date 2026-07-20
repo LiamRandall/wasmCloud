@@ -19,6 +19,7 @@ members = [
     "keyvalue-implements",
     "postgres-implements",
     # P3 fixtures (wasm32-wasip1 + reactor adapter)
+    "mem-probe-p3",
     "http-handler-p3",
     "http-blobstore-p3",
     "cli-service-p3",

@@ -88,6 +88,7 @@ const P2_FIXTURES: &[&str] = &[
 ];
 
 const P3_FIXTURES: &[&str] = &[
+    "mem-probe-p3",
     "http-handler-p3",
     "http-blobstore-p3",
     "cli-service-p3",
@@ -125,10 +126,14 @@ fn build_fixtures(workspace: &Path) -> Result<()> {
     fs::create_dir_all(&wasm_dir)
         .with_context(|| format!("failed to create {}", wasm_dir.display()))?;
 
-    let wash = ensure_wash(workspace)?;
+let wash = ensure_wash(workspace)?;
 
+    // XTASK_SKIP_P2: escape hatch to build only the p3 set (the p2 batch
+    // fails on postgres-implements toolchain skew on some hosts).
+    let skip_p2 = std::env::var("XTASK_SKIP_P2").is_ok();
     let fixtures = P2_FIXTURES
         .iter()
+        .filter(|_| !skip_p2)
         .map(|f| (*f, FixtureKind::P2))
         .chain(P3_FIXTURES.iter().map(|f| (*f, FixtureKind::P3)));
     let mut count = 0;
