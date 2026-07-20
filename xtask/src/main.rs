@@ -97,6 +97,7 @@ const P2_FIXTURES: &[&str] = &[
 ];
 
 const P3_FIXTURES: &[&str] = &[
+    "mem-probe-p3",
     "http-handler-p3",
     "http-blobstore-p3",
     "cli-service-p3",
