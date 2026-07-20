@@ -88,6 +88,31 @@ pub(crate) fn http_ingress_hostnames(interfaces: &[crate::wit::WitInterface]) ->
     hosts
 }
 
+/// Normalize a hostname for routing table keys: DNS names are
+/// case-insensitive (RFC 9110 section 7.2, RFC 4343) and clients include the
+/// port in `Host` whenever they connect to a nonstandard port
+/// (`Host: bench:8080`). Registration stores normalized keys and lookup
+/// normalizes on miss, so `BENCH`, `bench:8080`, and `bench` all route to the
+/// same workload. An IPv6 literal keeps its brackets (`[::1]:8080` -> `[::1]`).
+fn normalize_host(raw: &str) -> String {
+    let host = raw.trim();
+    let without_port = if let Some(bracket_end) = host.rfind(']') {
+        // IPv6 literal: anything after the closing bracket is a port
+        &host[..=bracket_end]
+    } else if let Some(colon) = host.rfind(':') {
+        // Only strip a well-formed numeric port; leave anything else intact
+        // so a malformed header fails lookup instead of aliasing a real host.
+        if !host[colon + 1..].is_empty() && host[colon + 1..].bytes().all(|b| b.is_ascii_digit()) {
+            &host[..colon]
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+    without_port.to_ascii_lowercase()
+}
+
 fn is_valid_hostname(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
@@ -222,6 +247,9 @@ impl DynamicRouter {
     /// Map every hostname in `hostnames` to `workload_id` (and record the
     /// reverse mapping for unbind).
     async fn register_hostnames(&self, workload_id: &str, hostnames: Vec<String>) {
+        // Keys are stored normalized (lowercase, portless) so lookup matches
+        // whatever case/port form the client sends. See `normalize_host`.
+        let hostnames: Vec<String> = hostnames.iter().map(|h| normalize_host(h)).collect();
         {
             let mut lock = self.workload_to_host.write().await;
             lock.insert(workload_id.to_string(), hostnames.clone());
@@ -352,8 +380,19 @@ impl Router for DynamicRouter {
                 .and_then(|h| h.to_str().ok())
                 .or_else(|| req.uri().authority().map(|a| a.as_str()))
                 .ok_or(RouteError::MissingHost)?;
-            let Some(workload_set) = lock.get(workload_host) else {
-                return Err(RouteError::NoWorkloadForHost(workload_host.to_string()));
+            // Fast path: canonical (lowercase, portless) Host matches directly
+            // with no allocation. On miss, normalize (case, `:port`) and retry
+            // before giving up — real clients send `Host: name:port` on
+            // nonstandard ports, and DNS names are case-insensitive.
+            let normalized;
+            let workload_set = match lock.get(workload_host) {
+                Some(set) => set,
+                None => {
+                    normalized = normalize_host(workload_host);
+                    lock.get(&normalized).ok_or_else(|| {
+                        RouteError::NoWorkloadForHost(workload_host.to_string())
+                    })?
+                }
             };
 
             // Entry exists but is empty so treat it as "no workload bound" from the
@@ -2158,6 +2197,53 @@ mod tests {
             .uri(uri)
             .body(HyperOutgoingBody::default())
             .unwrap()
+    }
+
+    // --- hostname normalization / DynamicRouter routing tests ---
+
+    #[test]
+    fn normalize_host_cases() {
+        assert_eq!(normalize_host("bench"), "bench");
+        assert_eq!(normalize_host("BENCH"), "bench");
+        assert_eq!(normalize_host("Bench.Example.COM"), "bench.example.com");
+        assert_eq!(normalize_host("bench:8080"), "bench");
+        assert_eq!(normalize_host("BENCH:8080"), "bench");
+        assert_eq!(normalize_host(" bench "), "bench");
+        assert_eq!(normalize_host("[::1]:8080"), "[::1]");
+        assert_eq!(normalize_host("[::1]"), "[::1]");
+        // not a numeric port: leave intact (fails lookup instead of aliasing)
+        assert_eq!(normalize_host("bench:80x"), "bench:80x");
+        assert_eq!(normalize_host("bench:"), "bench:");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn router_matches_case_and_port_variants() {
+        let router = DynamicRouter::default();
+        router
+            .register_hostnames("wl-1", vec!["Bench.Example.com".to_string()])
+            .await;
+        let lock = router.host_to_workload.read().await;
+        // stored normalized
+        assert!(lock.contains_key("bench.example.com"));
+        assert!(!lock.contains_key("Bench.Example.com"));
+        // lookup-side normalization: what route_incoming_request does on miss
+        for client_host in [
+            "bench.example.com",
+            "BENCH.EXAMPLE.COM",
+            "bench.example.com:8080",
+            "Bench.Example.COM:18098",
+        ] {
+            let hit = lock
+                .get(client_host)
+                .or_else(|| lock.get(&normalize_host(client_host)));
+            assert!(hit.is_some(), "expected {client_host} to route");
+            assert!(hit.unwrap().contains("wl-1"));
+        }
+        assert!(
+            lock.get("other.example.com")
+                .or_else(|| lock.get(&normalize_host("other.example.com")))
+                .is_none()
+        );
     }
 
     // --- check_allowed_hosts tests ---
